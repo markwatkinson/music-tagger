@@ -3,7 +3,7 @@
 * might work on other OSes too.
 
 
-Requires Python2.x and (TagPy)[http://mathema.tician.de/software/tagpy], which
+Requires Python2.x and [TagPy](http://mathema.tician.de/software/tagpy), which
 is probably in your distro's repositories, perhaps as tagpy, or taglib-python
 or something similar.
 
