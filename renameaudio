@@ -1,0 +1,845 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#  
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+# renameaudio version 1.1
+# 1.1 additions: nice new features and terrible new code
+
+# for ease of distribution this is all in one source file
+# although technically there are at least 3 things going
+# on in here. I recommend heading down to the bottom
+# first before worrying about a lot of these functions, 
+# as many are just sub-processes of the high level ones
+# at the bottom.
+
+
+import os
+import sys
+import re
+
+import codecs
+
+usetagpy = True
+
+try:
+  import tagpy
+except:
+  if not "--dont-tag" in sys.argv:
+    print "Error: You do not have TagPy installed. Tagging of audio files will fail"
+    print "Visit http://mathema.tician.de/software/tagpy to obtain TagPy,"\
+    "alternately your distro may provide it (fedora: yum install python-taglib)"
+    print "Rerun with --dont-tag to disable tagging, but you will need to use"
+    print "a file-list for renaming to work. Any present tags will be unaffected"
+    sys.exit()
+  usetagpy = False
+
+######################
+# defaults
+######################
+# see build_predefined_formats for how this is filled in by default
+#
+predefined_formats = []  
+artist = None
+album = None
+year = None
+genre = None
+title = None
+
+# track number to start at. The first entry in the songlist
+# will correspond to the track with this name/number.
+start = 1
+
+# offset to apply to the current track numbers
+track_no_offset = 0
+
+songlist_location = os.getcwd() + "songlist"
+
+format = None #if not none represents a custom naming format
+
+num_leading_zeros = 0 #number of leading zeros in track numbering in filename.
+
+# not-quite-yet regex search pattern to extract track numbering from filename,
+# the hashes represent a digit.
+search_pattern = "(^|[^0-9])##([^0-9]|$)"
+
+# options
+rename = True
+saferun = False
+exact_songlist = False    # treat the songlist's entries as EXACT representations
+                           # of tracknames, don't try to pull out numbering or anything.
+ignore_numbering = False   # ignore numbering in songlist
+use_songlist = False     
+files = []                 # files to operate on
+
+recursive = False
+
+no_spaces = False          # replace spaces in filenames
+separator = " - "          # separator in filename between number/artist/title, etc 
+
+# a cache of tag data, to avoid having to re-parse a lot of stuff between tagging and renaming
+tag_cache = {}
+
+
+# Builds the pre-defined formats array.
+def build_predefined_formats():
+  global separator, no_spaces, predefined_formats
+  predefined_formats = [
+    "%artist" + separator + "%title.%ext",
+    "%trackno" + separator + "%title.%ext",
+    "%trackno" + separator + "%artist" + separator + "%title.%ext",
+
+    "%album/%artist" + separator + "%title.%ext",
+    "%album/%trackno" + separator + "%title.%ext",
+    "%album/%trackno" + separator + "%artist" + separator + "%title.%ext",
+    "[%year] %album/%trackno" + separator + "%artist" + separator + "%title.%ext",
+
+    "%artist" + separator + "%album/%title.%ext",
+    "%artist" + separator + "%album/%trackno" + separator + "%title.%ext",
+
+    "%artist/%album/%title.%ext",
+    "%artist/%album/%artist" + separator + "%title.%ext",
+    "%artist/%album/%trackno" + separator + "%title.%ext",
+    "%artist/%album/%trackno" + separator + "%artist" + separator + "%title.%ext",
+    "%artist/[%year] %album/%trackno" + separator + "%artist" + separator + "%title.%ext",
+  ]
+  if no_spaces:
+    predefined_formats = [f.replace(" ", "_") for f in predefined_formats]
+
+def print_help():
+  global format, search_pattern
+  print """Usage:
+  $ {0} [options] file1 file2 .. filen 
+    (but use *.ogg or similar instead of a file list)
+
+The given files should contain in them a substring like 01 or 04
+to identify their order. The pattern you use can be defined on the
+--custom-file-pattern argument.
+
+{0} expects to find a file in the working directory named
+'songlist' containing line-by-line an ordered list of track names.
+Lines may optionally be prefixed by a track number.
+The first line may optionally be of the format:
+        ARTIST\tALBUM\tYEAR\tGENRE (separated by tabs)
+
+Possible bugs: There might still be some unicode strangeness
+               lurking around, and this hasn't really been tested
+               without tagpy
+
+Recursing file trees is not supported because it is difficult to
+specify which files to include and exclude, and what to do with
+those that are excluded (e.g. album art)
+If recursion is desired, it would be best to wrap this in a shell
+script which recurses downwards then applies this script
+individually to each directory.
+
+
+OPTIONS:
+  -s                      Start at the given number
+                          i.e. if s=2, track02.input => track01.output
+
+  -o                      Numeric offset to apply to the track numbers
+
+  -t                      location of songlist (default is in the cwd)
+
+  --no-songlist           Don't use a songlist. Retain information
+                          currently present in tags, or override with
+                          command line options
+
+  --artist                Artist name
+
+  --album                 Album name
+
+  --year                  Year of release
+
+  --genre                 Album's genre
+
+  --title                 Track's title (don't use on multiple files)
+
+  --saferun               Print operations, but don't perform
+
+  --ignore-track-numbering Ignores tracknumbers in songlist
+
+  --exact-songlist       Specify that the songlist contains ONLY
+                         tracknames, no other patterns (like numbers)
+                         (use this for compatability if the songlist is
+                         read incorrectly)
+
+  -f                     Select a pre-defined naming format,
+                         see --show-formats.
+                         You may override this with --format
+
+  --show-formats         Lists the pre-defined naming formats
+
+  --format               Override naming format, valid fields:
+                           %artist
+                           %album
+                           %title
+                           %trackno
+                           %year
+                           %genre
+                           %ext  (extension, i.e. ogg/mp3)
+                         Default: {1}
+
+  --dont-tag             Disable tagging, rename only
+
+  --dont-rename          Disable renaming, tag only
+
+  --custom-file-pattern   Custom file pattern used to identify input track
+                          order. This paramter is a regex (remember to escape!).
+                          Use the character '#' in your pattern to identify
+                          a single digit. This digit is used for identifying the
+                          order of the files (i.e. how they correspond to the
+                          songlist). Use multiple #s to denote leading zeros
+                          Default:", search_pattern
+                          where the ## refers to '01', '02', etc
+
+  --separator             Re-define the separator char from '-' to a custom
+                          string
+
+  --no-spaces             Replace spaces in filenames with underscores
+""".format(sys.argv[0], format)
+  
+
+# prints the 'help' for the predefined formats.
+# what this involves is a list of each format, and an example for each.
+def list_formats_help():
+  global predefined_formats, num_leading_zeros, no_spaces, separator
+  print "#\tFormat"
+  for i, f in enumerate(predefined_formats):
+    print str(i+1) + "\t" + f
+  print ""
+  print "Examples:"
+
+  ex_artist = "Metallica"
+  ex_album = "Master Of Puppets"
+  ex_ext = "ogg"
+  ex_title = "Battery"
+  ex_trackno = "1"
+  while len(ex_trackno) < num_leading_zeros:
+    ex_trackno = "0" + ex_trackno
+  ex_year = "1986"
+  print "#\tFormat"
+  for i, f in enumerate(predefined_formats):
+    f = f.replace("%artist", ex_artist)
+    f = f.replace("%album", ex_album)
+    f = f.replace("%ext", ex_ext)
+    f = f.replace("%title", ex_title)
+    f = f.replace("%trackno", ex_trackno)
+    f = f.replace("%year", ex_year)
+    if no_spaces:
+      f = f.replace(" ", "_")
+    print str(i+1) + "\t" + f
+
+
+
+# command arg parsing
+def get_arg_value(arg, default=None):
+  if arg in sys.argv:
+    index = sys.argv.index(arg)
+    if len(sys.argv) > index + 1:
+      return sys.argv[index+1]
+  return default
+
+  
+  
+# builds the 'files' array from the options specified at
+# the command line
+def parse_args_files():
+  global files, recursive
+  value_args = ["--artist",
+    "--album",
+    "--year",
+    "--genre",
+    "--title",
+    "--format",
+    "-s",
+    "-f",
+    "-t",
+    "--custom-file-pattern",
+    "-o"]
+  bool_args = ["--saferun",
+    "--ignore-track-numbering",
+    "--exact-songlist",
+    "--show-formats",
+    "--dont-tag",
+    "--dont-rename",
+    "--no-songlist"]
+  skip = False
+  for a in sys.argv[1:]:
+    
+    if skip:
+      skip = False
+      continue
+    if a in value_args:
+      skip = True
+      continue
+    elif a in bool_args:
+      continue
+
+    # if we get to here, the argument is (we assume) a filename
+    
+    files.append(a)
+
+  if len(files) == 0:
+    print "Error: No files specified"
+    sys.exit()
+
+# parses all command line arguments and sets program state accordingly.
+
+def parse_args():
+  global artist, album, year, genre, start, songlist_location, format
+  global num_leading_zeros, search_pattern, rename, saferun, exact_songlist
+  global ignore_numbering, usetagpy , use_songlist, separator, no_spaces
+  global recursive, track_no_offset
+
+  if "--help" in sys.argv:
+    print_help()
+    sys.exit()
+
+
+  
+  start = get_arg_value("-s", 1)
+  try:
+    start = int(start)
+  except:
+    print "Invalid argument for -s", start
+    sys.exit()
+    
+  songlist_location = get_arg_value("-t", os.getcwd() + "/songlist")
+  artist = get_arg_value("--artist")
+  album = get_arg_value("--album")
+  year = get_arg_value("--year")
+  genre = get_arg_value("--genre")
+  title = get_arg_value("--title")
+  try:
+    track_no_offset = int(get_arg_value("-o", 0))
+  except:
+    track_no_offset = 0
+
+  separator = get_arg_value("--separator", separator)
+  no_spaces = "--no-spaces" in sys.argv
+  recursive = "-r" in sys.argv
+  build_predefined_formats()
+
+  
+  predef_format = get_arg_value("-f", 1)
+  try:
+    predef_format = int(predef_format)
+    if (predef_format < 1 or predef_format > len(predefined_formats)):
+      raise Exception
+    format = predefined_formats[predef_format-1]
+  except:
+    print "Invalid argument for -f", predef_format
+    sys.exit()
+
+  format = get_arg_value("--format", predefined_formats[predef_format-1])
+  
+  
+  rename = "--dont-rename" not in sys.argv
+  if usetagpy:
+    usetagpy = "--dont-tag" not in sys.argv
+
+  saferun = "--saferun" in sys.argv
+  ignore_numbering =  "--ignore-track-numbering" in sys.argv
+  exact_songlist = "--exact-songlist" in sys.argv
+
+  num_leading_zeros = 0
+  search_pattern = get_arg_value("--custom-file-pattern", search_pattern)
+  try:
+    num_leading_zeros =  len(re.search("#+", search_pattern).group(0))
+  except:
+    print "Error: your --custom-file-pattern appears to contain no # characters, "\
+    "which are used for identifying file order. (see --help)"
+    sys.exit()
+
+
+
+  if "--show-formats" in sys.argv:
+    list_formats_help()
+    sys.exit()    
+
+  use_songlist = "--no-songlist" not in sys.argv
+  if not use_songlist and "-t" in sys.argv:
+    print "Error: Inconsistent options: --no-songlist and -t"
+    sys.exit()
+
+  if use_songlist and not "-t" in sys.argv:
+    if not os.path.exists(os.getcwd() + "/songlist"):
+      print "No songlist found"
+      use_songlist = False
+
+
+  parse_args_files()
+      
+# searches the given files for files matching a regex pattern
+# and returns the filename of the matching file.
+# the pattern should uniquely identify no more than 1 file 
+# else the program will exit. If no files are matched it
+# will return None.
+def search(files, pattern):
+  fname = None
+  for f in files:
+    if re.search(pattern, f) is not None:
+      if fname is None:
+        fname = f
+      else:
+        print "Error: Your file pattern is not unique"
+        print pattern, "matches both", f, "and", fname, "and maybe more."
+        print "Please use --custom-file-pattern to define a unique file pattern."
+        sys.exit()
+  return fname
+
+# Guesses the track number of a filename by simply extracting
+# numbers from it. This isn't perfect and shouldn't be used 
+# unless there's no other info to go on.
+def guess_trackno(filename):
+  match = re.search("[0-9]+", filename)
+  if match is not None:
+    return int(match.group(0))
+  return None
+
+# trims a string of excess whitespace, and if there are
+# two quote marks, it will extract the string between them
+# this is intended to be used when parsing the songlist, which
+# may have strings in the form:
+# 01 - "Song title" - (length)
+
+def trim_title(title):
+  title = title.lstrip().rstrip()
+  if len(title):
+    if title[0] == "\"" and title[len(title)-1] == "\"":
+      title = title[1:-1]
+  return title
+  
+# escapes a filename suitable to be written to the file system.
+def escape_name(name):
+  if name is None:
+    return None
+  name = name.replace("/", "-")
+  name = name.replace("\"", "")
+  name = name.replace("*", "")
+  name = name.replace(":", "")
+  name = name.replace("<", "")
+  name = name.replace(">", "")
+  name = name.replace("\\", "")
+  name = name.replace("|", "")
+  
+  return name
+
+# pads a string with leading zeros so that it is 'num' digits
+# long.
+def pad_leading_zeros(string, num):
+  while len(string) < num:
+    string = "0" + string
+  return string
+
+  
+# Attempts to extract a numerical from a songlist entry,
+# this prefix is likely to be a track-number
+def extract_numerical_prefix(line):
+  match = re.search("^[\s]*[0-9]+[\s]*.*?[\s]*",  line)
+  return match
+
+  
+# parses a line in the songlist file.
+# attempts to return the tuple (track_number, title)
+# track_number may well be None. title hopefully isn't.
+def parse_line(line, numerical_prefixed=False, quoted=False):
+  line = line.lstrip().rstrip()
+  trackno = None
+
+  if numerical_prefixed:
+    match = extract_numerical_prefix(line)
+    prefix = ""
+    if match is not None:
+      index = match.end()
+      prefix = line[0:index]
+      if len(line) > index+1:
+	line = line[index+1:]    
+      else: line = ""
+      trackno = re.search("[0-9]+", prefix).group()
+  line = line.lstrip().rstrip()  
+  if quoted and len(line) > 0 and line[0] == "\"":
+    index = line.find("\"", 1)
+    line = line[1:index]
+  
+  return (trackno, line.lstrip().rstrip())
+  
+
+
+# returns a tagpy file reference for the given filename.
+# this is used to access the file's tags.
+def get_file_ref(filename):
+  fref = None
+  try:
+    fref = tagpy.FileRef(filename)
+  except ValueError as err:
+    print "Fatal exception:", err
+    print "when trying to open", filename
+    print ""
+    if os.path.exists(filename):
+      print "It appears that tagpy does not support this file's format"
+      print "You can still rename the file(s) by re-running with --dont-tag, but you will have to tag them some other way"
+    else:
+      print "The file does not exist"
+    sys.exit()
+  return fref
+
+# sets a given filename's tags to be the tag data given by the 
+# dictionary 'details'.
+# valid keys are: artist, album, year, genre, title, trackno.
+def set_track_details(filename, details):
+  global tag_cache, saferun
+  
+  data = details.keys()
+
+  tag_cache[filename] = details
+    
+  if not saferun:
+    fref = get_file_ref(filename)
+    t = fref.tag()
+    if "artist" in data:
+      t.artist = details["artist"]
+    if "album" in data:
+      t.album = details["album"]
+    if "year" in data:
+      t.year = int(details["year"])
+    if "genre" in data:
+      t.genre = details["genre"]
+    if "title" in data:
+      t.title = details["title"]
+    if "trackno" in data:
+      t.track = int(details["trackno"])
+    fref.save()
+
+# returns a dictionary fo the given filename's tag details.
+# valid keys are: artist, album, year, genre, title, trackno.
+
+def get_track_details(filename):
+
+  global usetagpy, album, artist, genre, year, title, tag_cache, saferun
+  
+  if filename in tag_cache.keys():
+    return tag_cache[filename]
+
+  track = {}
+  if usetagpy:
+    fref = get_file_ref(filename)
+    t = fref.tag()
+    if len(t.artist):
+      track["artist"] = t.artist
+    if len(t.album):
+      track["album"] = t.album
+    if t.year:
+      track["year"] = t.year
+    if len(t.genre):
+      track["genre"] = t.genre
+    if t.track:
+      track["trackno"] = t.track
+    if len(t.title):
+      track["title"] = t.title
+  else:
+    if artist:
+      track["artist"] = artist
+    if genre:
+      track["genre"] = genre
+    if year:
+      track["year"] = year
+    if album:
+      track["album"] = album
+  ext = ""
+  try:
+    ext = filename.split(".")[-1]
+  except:
+    pass
+  track["ext"] = ext
+  return track
+
+# fills in the data in thef ile name, from the template format to 
+# the actual data, i.e. it fills in values for %trackno, %title etc
+def translate_file_name(filename, details, num_leading_zeros = 2):
+
+  global nospaces
+  data = details.keys()
+  
+  if "title" in data:
+    filename = filename.replace("%title", escape_name(details["title"]))
+  if "artist" in data:
+    filename = filename.replace("%artist", escape_name(details["artist"]))
+  if "album" in data:
+    filename = filename.replace("%album", escape_name(details["album"]))
+  if "trackno" in data:
+    filename = filename.replace("%trackno", pad_leading_zeros(str(details["trackno"]),
+    num_leading_zeros))
+  if "year" in data:
+    filename = filename.replace("%year", escape_name(str(details["year"])))
+  if "genre" in data:
+    filename = filename.replace("%genre", escape_name(details["genre"]))
+  if "ext" in data:
+    filename = filename.replace("%ext", escape_name(details["ext"]))
+  if no_spaces:
+    filename = filename.replace(" ", "_")
+  return filename
+
+
+# tags all files without using a songlist.
+def tag_files_no_songlist():
+  global files, album, artist, year, title, genre, saferun, track_no_offset
+
+  
+  for filename in files:
+    details = get_track_details(filename)
+    if artist is not None and len(artist):
+      details["artist"] = artist
+    if album is not None and len(album):
+      details["album"] = album
+    if genre is not None and len(genre):
+      details["genre"] = genre
+    if year is not None and year > 0:
+      details["year"] = year
+    if title is not None and len(title):
+      details["title"] = title
+    details["trackno"] += track_no_offset
+      
+    set_track_details(filename, details)
+  return
+
+
+
+# the tagger invocation function
+def tag_files():
+  global files, songlist_location, start, album, artist, year, genre, saferun
+  global num_leading_zeros, search_pattern, exact_songlist, ignore_numbering
+  global use_songlist, track_no_offset
+
+
+  
+  f = None
+  try:
+    f = codecs.open(songlist_location, encoding="utf-8")
+  except Exception as (errno, errstr):
+    print "Exception caught:", errno, ":", errstr
+    print "are you missing the songlist? (see --help)"
+    sys.exit()
+
+  # first we make a pass over the songlist to
+  #figure out if the lines have a numerical prefix or
+  # are wrapped in quotes
+  numeric_prefix = True
+  quote_wrapped = True
+  for line in f:
+    if line.lstrip().rstrip() == "":
+      continue
+    if "\t" in line:  #artist/album/year/genre identifier
+      continue
+    if extract_numerical_prefix(line) is None:
+      numeric_prefix = False
+    if line.count("\"") != 2:
+      quote_wrapped = False
+
+  f.seek(0)
+
+  i = start
+  trackno = 1 + track_no_offset
+
+  for lineno, line in enumerate(f):
+    if line.lstrip().rstrip() == "":
+      continue
+    
+    if lineno == 0 and "\t" in line:
+      a = line.lstrip().rstrip().split("\t")
+      try:
+        if artist is None:
+          artist = a[0].lstrip().rstrip()
+        if album is None:
+          album = a[1].lstrip().rstrip()
+        if year is None:
+          year = a[2].lstrip().rstrip()
+        if genre is None:
+          genre = a[3].lstrip().rstrip()
+      except:
+        pass
+      continue
+    try:
+      year = int(year)
+    except:
+      year = None
+
+    search_i = str(i)
+    while len(search_i) < num_leading_zeros:
+      search_i = "0" + search_i
+    pattern = re.sub("(#){" + str(num_leading_zeros) + "}", search_i, search_pattern)
+    filename = search(files, pattern)
+    if filename is None:
+      print "Warning: no file found for", pattern
+      i+=1
+      continue
+
+    tno, title = (None, line.lstrip().rstrip())
+    if not exact_songlist:
+      (tno, title) = parse_line(line, numeric_prefix, quote_wrapped)
+
+    if tno is not None and not ignore_numbering:
+      trackno = int(tno)
+
+    
+    details = {}
+    if artist is not None and len(artist):
+      details["artist"] = artist
+    if title is not None and len(title):
+      details["title"] = title
+    if album is not None and len(album):
+      details["album"] = album
+    if genre is not None and len(genre):
+      details["genre"] = genre
+    if trackno is not None and trackno > 0:
+      details["trackno"] = trackno
+    if year is not None and year > 0:
+      details["year"] = year
+
+    ext = ""
+    try:
+      ext = filename.split(".")[-1]
+    except:
+      pass
+    details["ext"] = ext
+
+      
+    set_track_details(filename, details)
+    
+    i+=1
+    trackno+=1
+
+  f.close()
+  
+# the renamer invocation function
+def rename_files():
+  global num_leading_zeros, format, files, saferun, tag_cache
+
+  cwd = os.getcwd()
+  
+  for filename in files:
+
+    if not filename in tag_cache.keys():
+      continue
+    
+    track_data = get_track_details(filename)
+    
+    new_name = translate_file_name(format, track_data, num_leading_zeros)
+    
+    if saferun:
+      print filename, "=>", new_name
+    else:
+      new_dirs = new_name.split("/")
+      if len(new_dirs):
+        new_dirs = new_dirs[:-1]
+      d = unicode(cwd + "/", "utf-8")
+      for new in new_dirs:
+
+	d = d + new + "/"
+        #d += new + "/"
+        try:
+          os.mkdir(d)
+        except Exception as (errno, strerr):
+          if errno != 17:
+            print "Fatal Exception caught:", strerr
+            sys.exit()
+      newpath = unicode(cwd + "/", "utf-8")
+      newpath += new_name
+      if os.path.exists(newpath):
+        print newpath, "exists!"
+        print "[r]eplace, [s]kip, or [c]ancel?"
+        response = raw_input()
+        if response.lower() == 'r':
+          pass
+        elif response.lower() == 's':
+          continue
+        else:
+          sys.exit()
+          
+      oldpath = unicode(cwd + "/", "utf-8")
+
+      oldpath += unicode(filename, "utf-8")
+      os.rename(oldpath, newpath)
+
+
+
+
+
+
+if __name__ == "__main__":
+  parse_args()
+
+  if not use_songlist:
+    print "Not using a songlist"
+
+
+  if (usetagpy):
+    if use_songlist:
+      tag_files()
+    else:
+      tag_files_no_songlist()
+
+  else:
+    # the tag cache won't have been built so let's build it
+    # The ironic thing is that I re-wrote this script to
+    # use this kind of system thinking it would be cleaner
+    # than the giant web of spaghetti I had before, now
+    # I end up with 'special cases'
+    
+    try:
+      f = codecs.open(songlist_location, encoding="utf-8")
+      for line in f:
+        line = line.lstrip().rstrip()
+        line = line.split("\t")
+        if artist is None:
+          artist = line[0]
+        if album is None:
+          album = line[1]
+        if year is None:
+          year = line[2]
+        if genre is None:
+          genre = line[3]
+    
+    except:
+      pass
+    try:
+      f.close()
+    except:
+      pass
+    for f in files:
+      details = get_track_details(f)
+      if artist is not None:
+        details["artist"] = artist
+      if album is not None:
+        details["album"] = album
+      if genre is not None:
+        details["genre"] = genre
+      if year is not None:
+        details["year"] = year
+
+      trackno = guess_trackno(f)
+      if trackno is not None:
+        details["trackno"] = trackno
+        
+      tag_cache[f] = details
+    apply_trackno_offset()  
+
+  if (rename):
+    rename_files()
+    
+  print "Done"
+  sys.exit()
